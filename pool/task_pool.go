@@ -14,7 +14,16 @@
 
 package pool
 
-import "context"
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+)
+
+var (
+	errTaskInvalid = errors.New("task invalid")
+	errTaskDemo    = errors.New("Demo")
+)
 
 // TaskPool 任务池
 type TaskPool interface {
@@ -58,13 +67,22 @@ func (t TaskFunc) Run(ctx context.Context) error {
 
 // BlockQueueTaskPool 并发阻塞的任务池
 type BlockQueueTaskPool struct {
+	concurrency int
+	queueSize   int
+	queue       chan func()
+
+	startSignal atomic.Value
 }
 
 // NewBlockQueueTaskPool 创建一个新的 BlockQueueTaskPool
 // concurrency 是并发数，即最多允许多少个 goroutine 执行任务
 // queueSize 是队列大小，即最多有多少个任务在等待调度
 func NewBlockQueueTaskPool(concurrency int, queueSize int) (*BlockQueueTaskPool, error) {
-	return &BlockQueueTaskPool{}, nil
+	return &BlockQueueTaskPool{
+		concurrency: concurrency,
+		queueSize:   queueSize,
+		queue:       make(chan func(), queueSize),
+	}, nil
 }
 
 // Submit 提交一个任务
@@ -72,15 +90,37 @@ func NewBlockQueueTaskPool(concurrency int, queueSize int) (*BlockQueueTaskPool,
 // 如果因为 ctx 的原因返回，那么将会返回 ctx.Err()
 // 在调用 Start 前后都可以调用 Submit
 func (b *BlockQueueTaskPool) Submit(ctx context.Context, task func()) error {
-	// TODO implement me
-	panic("implement me")
+
+	if task == nil {
+		return errTaskInvalid
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case b.queue <- task:
+		return nil
+	}
 }
 
 // Start 开始调度任务执行
 // Start 之后，调用者可以继续使用 Submit 提交任务
 func (b *BlockQueueTaskPool) Start() error {
 	// TODO implement me
-	panic("implement me")
+	if b.startSignal.Load().(bool) {
+		return errTaskInvalid
+	}
+
+	b.startSignal.Store(true)
+	for i := 0; i < b.concurrency; i++ {
+		go func() {
+			task, ok := <-b.queue
+			if !ok {
+				//	TODO
+			}
+			task()
+		}()
+	}
+	return nil
 }
 
 // Shutdown 将会拒绝提交新的任务，但是会继续执行已提交任务

@@ -17,12 +17,13 @@ package pool
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 )
 
 var (
-	errTaskInvalid = errors.New("task invalid")
-	errTaskDemo    = errors.New("Demo")
+	errTaskStarted = errors.New("task started")
+	errTaskStopped = errors.New("task stopped")
 )
 
 // TaskPool 任务池
@@ -69,19 +70,30 @@ func (t TaskFunc) Run(ctx context.Context) error {
 type BlockQueueTaskPool struct {
 	concurrency int
 	queueSize   int
-	queue       chan func()
-
+	taskQueue   chan func()
+	workerQueue chan func()
 	startSignal atomic.Value
+	stopSignal  atomic.Value
+	stopOnce    sync.Once
+	stopChan    chan struct{}
 }
 
 // NewBlockQueueTaskPool 创建一个新的 BlockQueueTaskPool
 // concurrency 是并发数，即最多允许多少个 goroutine 执行任务
 // queueSize 是队列大小，即最多有多少个任务在等待调度
 func NewBlockQueueTaskPool(concurrency int, queueSize int) (*BlockQueueTaskPool, error) {
+
+	stopSignal := atomic.Value{}
+	stopSignal.Store(false)
+	startSignal := atomic.Value{}
+	startSignal.Store(false)
 	return &BlockQueueTaskPool{
 		concurrency: concurrency,
 		queueSize:   queueSize,
-		queue:       make(chan func(), queueSize),
+		taskQueue:   make(chan func(), queueSize),
+		workerQueue: make(chan func(), concurrency),
+		startSignal: startSignal,
+		stopSignal:  startSignal,
 	}, nil
 }
 
@@ -92,12 +104,12 @@ func NewBlockQueueTaskPool(concurrency int, queueSize int) (*BlockQueueTaskPool,
 func (b *BlockQueueTaskPool) Submit(ctx context.Context, task func()) error {
 
 	if task == nil {
-		return errTaskInvalid
+		return errTaskStarted
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case b.queue <- task:
+	case b.taskQueue <- task:
 		return nil
 	}
 }
@@ -107,19 +119,12 @@ func (b *BlockQueueTaskPool) Submit(ctx context.Context, task func()) error {
 func (b *BlockQueueTaskPool) Start() error {
 	// TODO implement me
 	if b.startSignal.Load().(bool) {
-		return errTaskInvalid
+		return errTaskStarted
+	} else if b.stopSignal.Load().(bool) {
+		return errTaskStopped
 	}
-
 	b.startSignal.Store(true)
-	for i := 0; i < b.concurrency; i++ {
-		go func() {
-			task, ok := <-b.queue
-			if !ok {
-				//	TODO
-			}
-			task()
-		}()
-	}
+	go b.dispatch()
 	return nil
 }
 
@@ -129,11 +134,64 @@ func (b *BlockQueueTaskPool) Start() error {
 // Shutdown 无法中断正在执行的任务
 func (b *BlockQueueTaskPool) Shutdown() (<-chan struct{}, error) {
 	// TODO implement me
-	panic("implement me")
+
+	b.stopOnce.Do(func() {
+		b.startSignal.Store(false)
+		b.stopSignal.Store(true)
+		close(b.taskQueue)
+	})
+
+	return b.stopChan, nil
 }
 
 // ShutdownNow 立刻关闭任务池，并且返回所有剩余未执行的任务（不包含正在执行的任务）
 func (b *BlockQueueTaskPool) ShutdownNow() ([]Task, error) {
 	// TODO implement me
-	panic("implement me")
+
+	b.stopOnce.Do(func() {
+		b.startSignal.Store(false)
+		b.stopSignal.Store(true)
+		close(b.taskQueue)
+	})
+
+	tasks := make([]Task, 0)
+	for tas := range b.taskQueue {
+		task, ok := interface{}(tas).(Task)
+		if !ok {
+			continue
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, nil
+}
+
+func (b *BlockQueueTaskPool) handleTask(task func(), wg *sync.WaitGroup) {
+	for !b.stopSignal.Load().(bool) {
+		task()
+		task = <-b.workerQueue
+	}
+	wg.Done()
+}
+
+func (b *BlockQueueTaskPool) dispatch() {
+
+	defer close(b.stopChan)
+	var workerCount int
+	var wg sync.WaitGroup
+
+	select {
+	case task, ok := <-b.taskQueue:
+		if !ok {
+			break
+		}
+		select {
+		case b.workerQueue <- task:
+		default:
+			if workerCount < b.concurrency {
+				wg.Add(1)
+				go b.handleTask(task, &wg)
+			}
+		}
+		wg.Wait()
+	}
 }
